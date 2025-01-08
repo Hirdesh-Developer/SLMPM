@@ -43,4 +43,51 @@ ask_question("Please generate the json object of questions and answers from this
 
 
 
+
+
+def pdf_to_text(file_name):
+        file_path = os.path.join(pdf_path, file_name)
+        print("file_path : ", file_path)
+        extracted_text = []
+        all_text = ""
+        if file_path:
+            # ""
+            # classifier_result = Get_Pdf_to_Text.classifier(file_path)
+            # if 0 in classifier_result:
+            print("before convert to ")
+            images = convert_from_path(file_path)
+            print("before convert from ")
+            #     if images:
+            #         for i in range(len(images)):
+            #             text = pytesseract.image_to_string(images[i])
+            #             extracted_text.append({"text": text, "page_no": i + 1})
+            #         return extracted_text
+            #     else:
+            #         return extracted_text
+            # else:
+            #     with open(file_path, "rb") as f:
+            #         pdf = pdftotext.PDF(f)
+            #         if pdf:
+            #             for i in range(len(pdf)):
+            #                 extracted_text.append({"text": pdf[i], "page_no": i + 1})
+            #             return extracted_text
+            #         else:
+            #             return extracted_text
+            if images:
+
+                custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+                for i in range(len(images)):
+                    text = pytesseract.image_to_string(images[i], config=custom_config)
+                    all_text = all_text + " "+ text
+                    extracted_text.append({"text": text, "page_no": i + 1})
+                    print("extracted text 1 : ", extracted_text)
+                return extracted_text, all_text
+            else:
+                print("extracted text 2 : ",extracted_text)
+                return extracted_text, all_text
+        else:
+            return extracted_text, all_text
+
+
+
 # https://github.com/kennethleungty/Llama-2-Open-Source-LLM-CPU-Inference.git
