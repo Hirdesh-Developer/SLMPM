@@ -1,0 +1,330 @@
+import json
+import re
+import PyPDF2
+import time
+from openai import OpenAI
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import io
+import os
+from pathlib import Path
+import logging
+import requests
+import subprocess
+import sys
+import psutils
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+ 
+def wait_for_server(max_attempts=150):
+    """Wait for the vLLM server to become available."""
+    url = "http://localhost:8000/health"
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                logging.info("vLLM server is ready!")
+                return True
+        except requests.exceptions.RequestException:
+            time.sleep(2)
+    logging.error("vLLM server failed to start")
+    return False
+ 
+def start_vllm_server(model, max_retries=5):
+    cmd = [
+        "vllm",
+        "serve",
+        f"{model}",
+        "--gpu_memory_utilization=0.98",
+        "--max_model_len=8196",
+        "--num_scheduler_steps=2"
+    ]
+ 
+    for attempt in range(max_retries):
+        logging.info(f"Starting vLLM server: {' '.join(cmd)} (Attempt {attempt + 1})")
+        server_process = subprocess.Popen(cmd)
+ 
+        if wait_for_server():
+            return server_process
+        else:
+            logging.error(f"Attempt {attempt + 1} failed. Retrying...")
+            server_process.terminate()
+            time.sleep(2)  # Optional: wait before retrying
+ 
+    raise Exception("Server failed to start after multiple attempts")
+ 
+try:
+    server_process = start_vllm_server("hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+except Exception as e:
+    logging.error(f"Vllm server failed to start: {e}")
+    sys.exit(1)
+ 
+ 
+def get_cache_filename(pdf_path):
+    pdf_stat = os.stat(pdf_path)
+    pdf_modified_time = pdf_stat.st_mtime
+    base_name = Path(pdf_path).stem
+    cache_filename = f"{base_name}_{pdf_modified_time}.txt"
+    cache_dir = "pdf_cache"
+    return os.path.join(cache_dir, cache_filename)
+ 
+def save_text_cache(cache_path, text_pages):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(text_pages, f, ensure_ascii=False, indent=2)
+    logger.info(f"Text cache saved to {cache_path}")
+ 
+def load_text_cache(cache_path):
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            logger.info(f"Loading text cache from {cache_path}")
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+ 
+def extract_pdf_text_by_page(pdf_path):
+    cache_path = get_cache_filename(pdf_path)
+    cached_text = load_text_cache(cache_path)
+ 
+    if cached_text is not None:
+        logging.info(f"Loading text from cache: {cache_path}")
+        return cached_text
+ 
+    logging.info("Cache not found, extracting text from PDF.")
+    pdf_text_pages = []
+   
+    try:
+        with open(pdf_path, "rb") as pdf_file:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            total_pages = len(pdf_reader.pages)
+ 
+            for page_num in range(total_pages):
+                page = pdf_reader.pages[page_num]
+                page_text = page.extract_text() or ""
+ 
+                if not page_text.strip():
+                    pdf_doc = fitz.open(pdf_path)
+                    pdf_page = pdf_doc.load_page(page_num)
+                    image_list = pdf_page.get_images(full=True)
+ 
+                    if image_list:
+                        for img in image_list:
+                            xref = img[0]
+                            base_image = pdf_doc.extract_image(xref)
+                            image_bytes = base_image["image"]
+                            image = Image.open(io.BytesIO(image_bytes))
+                            ocr_text = pytesseract.image_to_string(image)
+                            page_text += ocr_text.strip()
+ 
+                    pdf_doc.close()
+                pdf_text_pages.append(page_text.strip() if page_text else "")
+        save_text_cache(cache_path, pdf_text_pages)
+    except Exception as e:
+        print(f"Error extracting PDF text: {str(e)}")
+ 
+    return pdf_text_pages or []
+ 
+def clean_json_response(response):
+    """
+    Attempt to extract a valid JSON array from a response, even if it is incomplete or contains unterminated strings.
+    """
+    response_str = "\n".join(response) if isinstance(response, list) else response
+    response_str = response_str.replace("```json", "").replace("```", "").strip()
+ 
+    # Search for a JSON array pattern using regex, even if it�s incomplete
+    json_array_match = re.search(r'(\[.*?\])', response_str, re.DOTALL)
+   
+    # Attempt to parse as JSON and handle unterminated strings by retrying with a trimmed response
+    if json_array_match:
+        json_str = json_array_match.group(1)
+ 
+        try:
+            json_data = json.loads(json_str)
+            return json_str  # Return valid JSON if successful
+ 
+        except json.JSONDecodeError as e:
+            # If error is due to unterminated strings or missing brackets, try trimming and re-validating
+            print(f"JSON extraction failed: {e}")
+            # Try a progressive trim of the response
+            for i in range(len(json_str), 0, -10):
+                try:
+                    trimmed_json_str = json_str[:i] + "]"  # Ensure it ends with a closing bracket
+                    json_data = json.loads(trimmed_json_str)
+                    return trimmed_json_str
+                except json.JSONDecodeError:
+                    continue  # Keep trimming until valid or no more retries
+ 
+    logger.error("JSON extraction failed: Incomplete or malformed response.")
+    return ""  # Return empty string if parsing fails
+ 
+def generate_qa_from_chunk(text_chunk, retries=3, max_tokens=2500):
+    """
+    Generate QA pairs based on a text chunk, with JSON validation, chunk splitting, and retry logic.
+    """
+    if not text_chunk.strip():
+        return ""  # Return empty if the chunk is blank
+ 
+    if len(text_chunk) > max_tokens:
+        # Recursively split chunk into smaller sections if it exceeds max token limit
+        half = len(text_chunk) // 2
+        return generate_qa_from_chunk(text_chunk[:half], retries) + \
+               generate_qa_from_chunk(text_chunk[half:], retries)
+    prompt = f"""You are an AI assistant tasked with generating informative question-answer pairs from text-based documents.
+INPUT CONTEXT:
+{text_chunk}
+TASK:
+Generate relevant question-answer pairs from the provided text. Each pair must:
+1. Be directly based on the information in the text
+2. Include a clear, specific question
+3. Provide an accurate, complete response
+4. Follow the exact JSON format specified below
+OUTPUT FORMAT REQUIREMENTS:
+1. Respond ONLY with a JSON array
+2. Each object must contain exactly two fields:
+- "prompt": the question
+- "response": the complete answer
+3. Include no text outside the JSON array
+4. Follow this exact structure:
+[
+    {{
+        "prompt": "What is the daily allowance for a Subedar on domestic travel?",
+        "response": "A Subedar is entitled to a daily allowance of Rupees 600 for domestic travel. This allowance covers meals and minor incidental expenses."
+    }},
+    {{
+        "prompt": "How much reimbursement can be claimed for travel by train for a Lieutenant Colonel?",
+        "response": "A Lieutenant Colonel is entitled to AC 1st class travel by train. The full fare for AC 1st class is reimbursed, provided the journey is undertaken for official purposes and valid tickets are submitted."
+    }},
+    {{
+        "prompt": "What is the limit for claiming hotel accommodation reimbursement for a Havildar?",
+        "response": "A Havildar can claim up to Rupees 2,500 per night for hotel accommodations during official travel, subject to submission of valid receipts and adherence to the approved lodging limits."
+    }}
+]
+Generate the QA pairs now, following the exact format shown above."""
+ 
+    attempt = 0
+    while attempt < retries:
+        try:
+            """Query the vLLM server with retries."""
+            url = "http://localhost:8000/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            response = requests.post(url, headers=headers, json=data, timeout=600)
+            response_data = response.json()  # Parse the JSON response
+ 
+            # Log the entire response for debugging
+            # logger.info("Response Data: %s", response_data)
+ 
+ 
+            # Check if 'choices' exists in the response
+            if 'choices' in response_data:
+                response_text = response_data['choices'][0]['message']['content'].strip()
+            else:
+                logger.error("Unexpected response format")
+                return ""
+ 
+            # Use improved JSON validation with trimming for incomplete responses
+            json_str = clean_json_response(response_text)
+            if json_str:
+                return json_str
+            else:
+                logger.warning("JSON response incomplete, retrying with split chunks.")
+                half = len(text_chunk) // 2
+                return generate_qa_from_chunk(text_chunk[:half], retries) + \
+                       generate_qa_from_chunk(text_chunk[half:], retries)
+ 
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed: {e}")
+            attempt += 1
+            time.sleep(5)  # Delay before retrying
+    logger.error("All attempts failed for this chunk.")
+    return ""
+ 
+def process_pdf_file_by_pages(pdf_path, output_json_file, pages_per_chunk=4, overlap=1):
+    pdf_text_pages = extract_pdf_text_by_page(pdf_path)
+    chunks = [' '.join(pdf_text_pages[i:i + pages_per_chunk])
+              for i in range(0, len(pdf_text_pages) - pages_per_chunk + 1, pages_per_chunk - overlap)]
+ 
+    logger.info(f"Total chunks to process: {len(chunks)}")
+    all_qa_pairs = []
+ 
+    for idx, chunk in enumerate(chunks):
+        logger.info(f"Processing chunk {idx + 1}...")
+        try:
+            qa_pairs = generate_qa_from_chunk(chunk)
+ 
+            if not qa_pairs:
+                logger.info(f"No QA pairs generated for chunk {idx + 1}")
+                continue
+ 
+            qa_pairs_cleaned = clean_json_response(qa_pairs)
+            if not qa_pairs_cleaned:
+                logger.error(f"Failed to clean JSON for chunk {idx + 1}")
+                continue
+ 
+            try:
+                qa_pairs_json = json.loads(qa_pairs_cleaned)
+                all_qa_pairs.extend(qa_pairs_json)
+                logger.info(f"Chunk {idx + 1} processed successfully.")
+            except json.JSONDecodeError as e:
+                logger.info(f"JSON decoding error for chunk {idx + 1}: {e}")
+                print(f"Raw cleaned response: {qa_pairs_cleaned}")
+ 
+        except Exception as e:
+            logger.error(f"Error processing chunk {idx + 1}: {e}")
+ 
+    if all_qa_pairs:
+        with open(output_json_file, 'w', encoding='utf-8') as json_file:
+            json.dump(all_qa_pairs, json_file, ensure_ascii=False, indent=4)
+        logger.info(f"QA pairs saved to {output_json_file}")
+    else:
+        logger.info("No QA pairs were successfully processed.")
+ 
+ 
+try:
+    pdf_path = "synctalk.pdf"
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]  
+    output_json_file = f'{base_name}.json'
+    process_pdf_file_by_pages(pdf_path, output_json_file)
+    print(f"QA pairs saved to {output_json_file}")
+ 
+finally:
+    def kill_existing_vllm_process():
+        for proc in psutil.process_iter(['pid', 'name']):
+            if 'vllm' in proc.info['name']:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    logger.info(f"Terminated existing vLLM process: {proc.info['pid']}")
+                except psutil.NoSuchProcess:
+                    continue
+                except psutil.TimeoutExpired:
+                    proc.kill()
+ 
+    # Call this before starting a new vLLM server
+    kill_existing_vllm_process()
+ 
+
+
+
+
+
+apt install tesseract-ocr
+PyPDF2==2.11.2 PyMuPDF==1.25.1\
+PyPDF2==2.11.2
+PyMuPDF==1.25.1
+pytesseract==0.3.10 vllm==0.6.6
+pytesseract==0.3.10
+vllm==0.6.6.post1
+
+
